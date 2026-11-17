@@ -59,39 +59,83 @@ struct AppSettings: Codable, Hashable {
     var reminderMinutes: Int = 10
 }
 
+struct TimetableRecord: Identifiable, Codable, Hashable {
+    var id: UUID
+    var name: String
+    var courses: [Course]
+    var settings: AppSettings
+}
+
 private struct StoredTimetable: Codable {
     var courses: [Course]
     var settings: AppSettings
+}
+
+private struct StoredTimetables: Codable {
+    var version: Int = 2
+    var timetables: [TimetableRecord]
+    var ownTimetableID: UUID
+    var selectedTimetableID: UUID
 }
 
 @MainActor
 final class AppStore: ObservableObject {
     @Published var courses: [Course] = []
     @Published var settings = AppSettings()
+    @Published private(set) var timetables: [TimetableRecord] = []
+    @Published private(set) var ownTimetableID = UUID()
+    @Published private(set) var selectedTimetableID = UUID()
     @Published var statusMessage: String?
     @Published private(set) var launchAtLogin = false
     @Published private(set) var canSave = true
 
     private let fileURL: URL
     private let enableSystemIntegration: Bool
+    private let writeData: (Data, URL) throws -> Void
     private let notificationPrefix = "timetable.course."
     private var notificationTask: Task<Void, Never>?
     private var refreshTimer: AnyCancellable?
 
-    init(fileURL: URL? = nil, enableSystemIntegration: Bool = true) {
+    init(fileURL: URL? = nil, enableSystemIntegration: Bool = true, writeData: @escaping (Data, URL) throws -> Void = { try $0.write(to: $1, options: .atomic) }) {
         self.enableSystemIntegration = enableSystemIntegration
+        self.writeData = writeData
         if let fileURL {
             self.fileURL = fileURL
         } else {
             let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
             self.fileURL = base.appendingPathComponent("TimetableApp", isDirectory: true).appendingPathComponent("timetable.json")
         }
+        let ownID = UUID()
+        ownTimetableID = ownID
+        selectedTimetableID = ownID
+        timetables = [TimetableRecord(id: ownID, name: "我的课表", courses: [], settings: settings)]
         do {
             if FileManager.default.fileExists(atPath: self.fileURL.path) {
                 let data = try Data(contentsOf: self.fileURL)
-                let saved = try JSONDecoder().decode(StoredTimetable.self, from: data)
-                courses = saved.courses
-                settings = saved.settings
+                guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    throw CocoaError(.fileReadCorruptFile)
+                }
+                if object["version"] != nil || object["timetables"] != nil {
+                    let saved = try JSONDecoder().decode(StoredTimetables.self, from: data)
+                    let ids = saved.timetables.map(\.id)
+                    guard saved.version == 2, !ids.isEmpty, Set(ids).count == ids.count,
+                          ids.contains(saved.ownTimetableID), ids.contains(saved.selectedTimetableID) else {
+                        throw CocoaError(.fileReadCorruptFile)
+                    }
+                    timetables = saved.timetables
+                    ownTimetableID = saved.ownTimetableID
+                    selectedTimetableID = saved.selectedTimetableID
+                    loadSelected()
+                } else {
+                    let saved = try JSONDecoder().decode(StoredTimetable.self, from: data)
+                    let migrated = TimetableRecord(id: ownID, name: "我的课表", courses: saved.courses, settings: saved.settings)
+                    timetables = [migrated]
+                    courses = saved.courses
+                    settings = saved.settings
+                    // 先完整解码再原子写入，迁移失败不覆盖旧文件。
+                    let output = StoredTimetables(timetables: timetables, ownTimetableID: ownID, selectedTimetableID: ownID)
+                    try self.writeData(JSONEncoder().encode(output), self.fileURL)
+                }
             }
         } catch {
             canSave = false
@@ -99,7 +143,7 @@ final class AppStore: ObservableObject {
         }
         if enableSystemIntegration {
             launchAtLogin = SMAppService.mainApp.status == .enabled
-            refreshNotifications()
+            if canSave { refreshNotifications() }
             refreshTimer = Timer.publish(every: 900, on: .main, in: .common).autoconnect().sink { [weak self] _ in
                 self?.refreshNotifications()
             }
@@ -107,19 +151,167 @@ final class AppStore: ObservableObject {
     }
 
     /// 写入本机并更新后续通知；写入失败时保留内存数据供用户重试。
-    func save() {
+    @discardableResult
+    func save(refreshOwnNotifications: Bool = true) -> Bool {
         guard canSave else {
             statusMessage = "读取本地课表失败，已暂停保存以保护原有数据，请检查本地数据文件。"
-            return
+            return false
         }
         do {
+            syncSelected()
             try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            let data = try JSONEncoder().encode(StoredTimetable(courses: courses, settings: settings))
-            try data.write(to: fileURL, options: .atomic)
-            refreshNotifications(requestPermission: settings.remindersEnabled)
+            let data = try JSONEncoder().encode(StoredTimetables(timetables: timetables, ownTimetableID: ownTimetableID, selectedTimetableID: selectedTimetableID))
+            try writeData(data, fileURL)
+            if let message = statusMessage, ["请输入课表名称。", "已有同名课表，请使用不同的名称。", "保存失败，请检查本机存储空间和文件权限。", "目标课表不存在或无法保存，请重新选择课表。"].contains(message) {
+                statusMessage = nil
+            }
+            if refreshOwnNotifications {
+                let own = timetable(id: ownTimetableID)
+                refreshNotifications(requestPermission: own?.settings.remindersEnabled == true)
+            }
+            return true
         } catch {
             statusMessage = "保存失败，请检查本机存储空间和文件权限。"
+            return false
         }
+    }
+
+    private func syncSelected() {
+        guard let index = timetables.firstIndex(where: { $0.id == selectedTimetableID }) else { return }
+        timetables[index].courses = courses
+        timetables[index].settings = settings
+    }
+
+    private func loadSelected() {
+        guard let selected = timetables.first(where: { $0.id == selectedTimetableID }) else { return }
+        courses = selected.courses
+        settings = selected.settings
+    }
+
+    private struct StateBackup {
+        var timetables: [TimetableRecord]
+        var selected: UUID
+        var courses: [Course]
+        var settings: AppSettings
+    }
+
+    private func stateBackup() -> StateBackup {
+        StateBackup(timetables: timetables, selected: selectedTimetableID, courses: courses, settings: settings)
+    }
+
+    private func restore(_ backup: StateBackup) {
+        timetables = backup.timetables
+        selectedTimetableID = backup.selected
+        courses = backup.courses
+        settings = backup.settings
+    }
+
+    private func ownHasUncommittedChanges() -> Bool {
+        guard selectedTimetableID == ownTimetableID,
+              let stored = timetables.first(where: { $0.id == ownTimetableID }) else { return false }
+        return stored.courses != courses || stored.settings != settings
+    }
+
+    var selectedTimetable: TimetableRecord? { timetable(id: selectedTimetableID) }
+
+    func timetable(id: UUID) -> TimetableRecord? {
+        guard var item = timetables.first(where: { $0.id == id }) else { return nil }
+        if id == selectedTimetableID { item.courses = courses; item.settings = settings }
+        return item
+    }
+
+    /// 他人的日历导出不携带提醒，以免为他人安排自己的通知。
+    func exportSnapshot(id: UUID) -> TimetableRecord? {
+        guard var item = timetable(id: id) else { return nil }
+        if id != ownTimetableID { item.settings.remindersEnabled = false }
+        return item
+    }
+
+    private func validName(_ name: String, excluding id: UUID? = nil) -> String? {
+        let value = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { statusMessage = "请输入课表名称。"; return nil }
+        guard !timetables.contains(where: { $0.id != id && $0.name.localizedCaseInsensitiveCompare(value) == .orderedSame }) else {
+            statusMessage = "已有同名课表，请使用不同的名称。"; return nil
+        }
+        return value
+    }
+
+    @discardableResult
+    func addTimetable(name: String) -> UUID? {
+        guard canSave, let name = validName(name), let own = timetable(id: ownTimetableID) else { return nil }
+        let backup = stateBackup()
+        let refresh = ownHasUncommittedChanges()
+        syncSelected()
+        var initialSettings = own.settings
+        initialSettings.remindersEnabled = false
+        let item = TimetableRecord(id: UUID(), name: name, courses: [], settings: initialSettings)
+        timetables.append(item)
+        selectedTimetableID = item.id
+        loadSelected()
+        guard save(refreshOwnNotifications: refresh) else { restore(backup); return nil }
+        return item.id
+    }
+
+    @discardableResult
+    func selectTimetable(id: UUID) -> Bool {
+        guard canSave, timetables.contains(where: { $0.id == id }) else { return false }
+        if id == selectedTimetableID { return true }
+        let backup = stateBackup()
+        let refresh = ownHasUncommittedChanges()
+        syncSelected()
+        selectedTimetableID = id
+        loadSelected()
+        guard save(refreshOwnNotifications: refresh) else { restore(backup); return false }
+        return true
+    }
+
+    @discardableResult
+    func renameTimetable(id: UUID, name: String) -> Bool {
+        guard canSave, let index = timetables.firstIndex(where: { $0.id == id }),
+              let name = validName(name, excluding: id) else { return false }
+        let backup = stateBackup()
+        let refresh = ownHasUncommittedChanges()
+        timetables[index].name = name
+        guard save(refreshOwnNotifications: refresh) else { restore(backup); return false }
+        return true
+    }
+
+    @discardableResult
+    func deleteTimetable(id: UUID) -> Bool {
+        guard canSave, id != ownTimetableID, timetables.contains(where: { $0.id == id }) else { return false }
+        let backup = stateBackup()
+        let refresh = ownHasUncommittedChanges()
+        syncSelected()
+        timetables.removeAll { $0.id == id }
+        if selectedTimetableID == id { selectedTimetableID = ownTimetableID; loadSelected() }
+        guard save(refreshOwnNotifications: refresh) else { restore(backup); return false }
+        return true
+    }
+
+    @discardableResult
+    func updateCourses(_ value: [Course], forID id: UUID) -> Bool {
+        guard canSave, let index = timetables.firstIndex(where: { $0.id == id }) else {
+            statusMessage = "目标课表不存在或无法保存，请重新选择课表。"; return false
+        }
+        let backup = stateBackup()
+        let refresh = id == ownTimetableID || ownHasUncommittedChanges()
+        if id == selectedTimetableID { courses = value } else { timetables[index].courses = value }
+        guard save(refreshOwnNotifications: refresh) else { restore(backup); return false }
+        return true
+    }
+
+    @discardableResult
+    func updateSettings(_ value: AppSettings, forID id: UUID) -> Bool {
+        guard canSave, let index = timetables.firstIndex(where: { $0.id == id }) else {
+            statusMessage = "目标课表不存在或无法保存，请重新选择课表。"; return false
+        }
+        let backup = stateBackup()
+        let refresh = id == ownTimetableID || ownHasUncommittedChanges()
+        var updated = value
+        if id != ownTimetableID { updated.remindersEnabled = false }
+        if id == selectedTimetableID { settings = updated } else { timetables[index].settings = updated }
+        guard save(refreshOwnNotifications: refresh) else { restore(backup); return false }
+        return true
     }
 
     private var calendar: Calendar {
@@ -143,6 +335,10 @@ final class AppStore: ObservableObject {
     }
 
     func date(forWeek week: Int, weekday: Int) -> Date? {
+        date(forWeek: week, weekday: weekday, settings: settings)
+    }
+
+    private func date(forWeek week: Int, weekday: Int, settings: AppSettings) -> Date? {
         guard week > 0, (1...7).contains(weekday) else { return nil }
         return calendar.date(byAdding: .day, value: (week - 1) * 7 + weekday - 1, to: monday(containing: settings.firstWeekDate))
     }
@@ -169,26 +365,32 @@ final class AppStore: ObservableObject {
         }
     }
 
-    /// 系统可安排的待发送通知数量有限，只保留最近的 60 条，并在应用运行时更新。
-    func refreshNotifications(requestPermission: Bool = false) {
-        guard enableSystemIntegration else { return }
-        let previousTask = notificationTask
-        previousTask?.cancel()
-        let snapshot = courses
-        let config = settings
-        let prefix = notificationPrefix
-        let center = UNUserNotificationCenter.current()
-        let candidateDates: [(Course, Date)] = snapshot.flatMap { course -> [(Course, Date)] in
+    /// 仅根据自己的课表计算提醒，切换查看其他人不影响日期和课程。
+    func ownNotificationCandidates(now: Date = Date()) -> [(Course, Date)] {
+        guard canSave, let own = timetable(id: ownTimetableID), own.settings.remindersEnabled else { return [] }
+        let config = own.settings
+        return own.courses.flatMap { course -> [(Course, Date)] in
             guard let period = config.periods.first(where: { $0.id == course.startPeriod }),
                   (0..<1440).contains(period.startMinutes) else { return [] }
             return course.weeks.compactMap { week in
-                guard let day = date(forWeek: week, weekday: course.weekday),
+                guard let day = date(forWeek: week, weekday: course.weekday, settings: config),
                       let start = calendar.date(byAdding: .minute, value: period.startMinutes, to: day),
                       let fire = calendar.date(byAdding: .minute, value: -max(0, config.reminderMinutes), to: start),
-                      fire > Date() else { return nil }
+                      fire > now else { return nil }
                 return (course, fire)
             }
         }.sorted { $0.1 < $1.1 }
+    }
+
+    /// 系统可安排的待发送通知数量有限，只保留最近的 60 条，并在应用运行时更新。
+    func refreshNotifications(requestPermission: Bool = false) {
+        guard enableSystemIntegration, canSave, let own = timetable(id: ownTimetableID) else { return }
+        let previousTask = notificationTask
+        previousTask?.cancel()
+        let config = own.settings
+        let prefix = notificationPrefix
+        let center = UNUserNotificationCenter.current()
+        let candidateDates = ownNotificationCandidates()
         notificationTask = Task {
             await previousTask?.value
             guard !Task.isCancelled else { return }

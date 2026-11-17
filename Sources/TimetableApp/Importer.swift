@@ -67,13 +67,11 @@ enum DocxImporter {
                 for paragraph in cell.paragraphs {
                     let line = paragraph.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !line.isEmpty, !dayNames.contains(where: { line.contains($0) }) else { continue }
-                    let courses = parseParagraph(line, weekday: day)
-                    if courses.isEmpty { result.skipped.append(line) }
+                    let parsed = parseParagraph(line, weekday: day)
+                    if parsed.courses.isEmpty { result.skipped.append(line) }
                     else {
-                        result.courses.append(contentsOf: courses)
-                        let weekMarkers = try! NSRegularExpression(pattern: #"\(\d+(?:\s*[~～\-—]\s*\d+)?(?:\s*\([单双]\))?\s*周\)"#)
-                        let count = weekMarkers.numberOfMatches(in: line, range: NSRange(location: 0, length: (line as NSString).length))
-                        if count > courses.count {
+                        result.courses.append(contentsOf: parsed.courses)
+                        if parsed.hasUnrecognized {
                             result.warnings.append("部分课程安排无法识别，请按原文手动补充：\(line)")
                         }
                     }
@@ -95,37 +93,46 @@ enum DocxImporter {
                 }
             }
         }
-        guard !result.courses.isEmpty else { throw DocxImportError.noCourses }
+        // 全部无法识别时仍返回跳过原文供用户核对；真正空表才报错。
+        guard !result.courses.isEmpty || !result.skipped.isEmpty else { throw DocxImportError.noCourses }
+        if result.courses.isEmpty { result.warnings.append("未识别到可导入的课程，请核对以下跳过内容。") }
         result.warnings.append("请逐条核对教师、地点和周次；原始内容可在编辑课程时查看。")
         if !result.skipped.isEmpty { result.warnings.append("部分内容缺少明确上课时间或无法识别，已列在跳过项目中。") }
         return result
     }
 
-    private static func parseParagraph(_ line: String, weekday: Int) -> [Course] {
-        // 一行可能依次包含多个独立周次与教室、教师组合。
-        let pattern = #"\((\d+(?:\s*[~～\-—]\s*\d+)?(?:\s*\([单双]\))?\s*周)\)\s*\((\d+)(?:\s*[-~～]\s*(\d+))?\s*节\)"#
-        let regex = try! NSRegularExpression(pattern: pattern)
+    private static func parseParagraph(_ line: String, weekday: Int) -> (courses: [Course], hasUnrecognized: Bool) {
+        // 先定位所有周次标记，再分别校验内容；无法解析的前段不能混入课程名称或后段。
+        let markerRegex = try! NSRegularExpression(pattern: #"[（(]([^()（）]*(?:[（(][^()（）]*[)）][^()（）]*)*)周[)）]"#)
+        let markerEndRegex = try! NSRegularExpression(pattern: #"周[)）]"#)
+        let periodRegex = try! NSRegularExpression(pattern: #"\s*[（(](\d+)(?:\s*[-~～—]\s*(\d+))?\s*节[)）]"#)
         let ns = line as NSString
-        let matches = regex.matches(in: line, range: NSRange(location: 0, length: ns.length))
-        guard let first = matches.first else { return [] }
+        let fullRange = NSRange(location: 0, length: ns.length)
+        let matches = markerRegex.matches(in: line, range: fullRange)
+        // 对括号无法配平的周次不尝试猜测，避免后面的有效片段污染课程名称。
+        guard markerEndRegex.numberOfMatches(in: line, range: fullRange) == matches.count,
+              let first = matches.first else { return ([], true) }
         var name = ns.substring(to: first.range.location).trimmingCharacters(in: .whitespacesAndNewlines)
         name = name.replacingOccurrences(of: #"\s+\d{1,3}$"#, with: "", options: .regularExpression).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty else { return [] }
+        guard !name.isEmpty else { return ([], true) }
         var courses: [Course] = []
+        var hasUnrecognized = false
         for (index, match) in matches.enumerated() {
             let weekText = ns.substring(with: match.range(at: 1))
-            let numbers = (try! NSRegularExpression(pattern: #"\d+"#)).matches(in: weekText, range: NSRange(location: 0, length: (weekText as NSString).length)).compactMap { Int((weekText as NSString).substring(with: $0.range)) }
-            guard let startWeek = numbers.first, startWeek > 0 else { continue }
-            let endWeek = numbers.count > 1 ? numbers[1] : startWeek
-            guard endWeek >= startWeek, endWeek <= 60 else { continue }
-            var weeks = Array(startWeek...endWeek)
-            if weekText.contains("单") { weeks = weeks.filter { $0 % 2 == 1 } }
-            if weekText.contains("双") { weeks = weeks.filter { $0 % 2 == 0 } }
-            guard !weeks.isEmpty, let startPeriod = Int(ns.substring(with: match.range(at: 2))) else { continue }
-            let endPeriod = match.range(at: 3).location == NSNotFound ? startPeriod : (Int(ns.substring(with: match.range(at: 3))) ?? startPeriod)
-            guard startPeriod > 0, endPeriod >= startPeriod, endPeriod <= 30 else { continue }
-            let start = NSMaxRange(match.range)
+            let periodStart = NSMaxRange(match.range)
+            let remaining = NSRange(location: periodStart, length: ns.length - periodStart)
+            guard let weeks = parseWeeks(weekText),
+                  let period = periodRegex.firstMatch(in: line, options: [.anchored], range: remaining),
+                  let startPeriod = Int(ns.substring(with: period.range(at: 1))) else {
+                hasUnrecognized = true; continue
+            }
+            let endPeriod = period.range(at: 2).location == NSNotFound ? startPeriod : (Int(ns.substring(with: period.range(at: 2))) ?? startPeriod)
+            guard startPeriod > 0, endPeriod >= startPeriod, endPeriod <= 30 else {
+                hasUnrecognized = true; continue
+            }
+            let start = NSMaxRange(period.range)
             let end = index + 1 < matches.count ? matches[index + 1].range.location : ns.length
+            guard start <= end else { hasUnrecognized = true; continue }
             let details = ns.substring(with: NSRange(location: start, length: max(0, end - start))).trimmingCharacters(in: .whitespacesAndNewlines)
             let parts = details.components(separatedBy: "\u{00a0}").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
             let location = parts.first ?? ""
@@ -134,7 +141,27 @@ enum DocxImporter {
             let teacher = teacherAndClass.components(separatedBy: try! NSRegularExpression(pattern: #"(?=\d|全校|[A-Za-z])"#)).first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             courses.append(Course(id: UUID(), name: name, teacher: teacher, location: location, weekday: weekday, startPeriod: startPeriod, endPeriod: endPeriod, weeks: weeks, rawText: line))
         }
-        return courses
+        return (courses, hasUnrecognized)
+    }
+
+    /// 以逗号拆分后逐段计算，单双周只作用于对应片段。
+    private static func parseWeeks(_ text: String) -> [Int]? {
+        let normalized = text.replacingOccurrences(of: "，", with: ",").replacingOccurrences(of: "、", with: ",")
+        let parts = normalized.components(separatedBy: ",")
+        let segment = try! NSRegularExpression(pattern: #"^\s*(\d+)(?:\s*[~～\-—至]\s*(\d+))?\s*(?:[（(]\s*([单双])\s*[)）])?\s*$"#)
+        var weeks = Set<Int>()
+        for part in parts {
+            let source = part as NSString
+            guard let match = segment.firstMatch(in: part, range: NSRange(location: 0, length: source.length)),
+                  let start = Int(source.substring(with: match.range(at: 1))), start > 0 else { return nil }
+            let end = match.range(at: 2).location == NSNotFound ? start : (Int(source.substring(with: match.range(at: 2))) ?? 0)
+            guard end >= start, end <= 60 else { return nil }
+            let parity = match.range(at: 3).location == NSNotFound ? "" : source.substring(with: match.range(at: 3))
+            let selected = (start...end).filter { parity.isEmpty || (parity == "单" ? $0 % 2 == 1 : $0 % 2 == 0) }
+            guard !selected.isEmpty else { return nil }
+            weeks.formUnion(selected)
+        }
+        return weeks.isEmpty ? nil : weeks.sorted()
     }
 }
 
